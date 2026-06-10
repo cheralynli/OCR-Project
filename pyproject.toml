@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "ocr-tesseract-camera"
+version = "0.1.0"
+description = "Live camera OCR for extracting L plus five digit codes."
+authors = ["chrlynn"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+opencv-python = "^4.12.0"
+pytesseract = "^0.3.13"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
