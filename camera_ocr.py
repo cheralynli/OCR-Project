@@ -32,8 +32,16 @@ AFTER_L_CODE_RE = re.compile(
     r"\bL\s*\d{5}\b\s*(?:\(\s*CM\s*\))?\s*[-–—_:]?\s*([A-Z0-9]{3,8})\b",
     re.IGNORECASE,
 )
+LIKELY_L_CODE_RE = re.compile(r"\b[Ll]([0-9OQDIIlTtS]{5})\b")
+CODEISH_TOKEN_RE = re.compile(r"\b(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{4,8}\b")
 EASYOCR_READER = None
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+EASYOCR_TEXT_THRESHOLD = 0.4
+EASYOCR_LOW_TEXT = 0.3
+EASYOCR_LINK_THRESHOLD = 0.4
+EASYOCR_CONTRAST_THRESHOLD = 0.05
+EASYOCR_ADJUST_CONTRAST = 0.7
+AGGRESSIVE_CODE_NORMALIZE = True
 
 
 def fail(message: str, exit_code: int = 1) -> None:
@@ -87,7 +95,34 @@ def preprocess_variants(frame):
         11,
     )
     inverted = cv2.bitwise_not(thresh)
-    return [frame, gray, scaled, big, thresh, adaptive, inverted]
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(scaled)
+    sharp = cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 1.2), -0.6, 0)
+    _, clahe_bw = cv2.threshold(
+        cv2.GaussianBlur(clahe, (3, 3), 0),
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    return [frame, gray, scaled, big, clahe, sharp, thresh, adaptive, clahe_bw, inverted, cv2.bitwise_not(clahe_bw)]
+
+
+def raw_preprocess_variants(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(scaled)
+    denoised = cv2.fastNlMeansDenoising(clahe, None, 10, 7, 21)
+    sharp = cv2.addWeighted(denoised, 1.7, cv2.GaussianBlur(denoised, (0, 0), 1.1), -0.7, 0)
+    _, otsu = cv2.threshold(
+        cv2.GaussianBlur(sharp, (3, 3), 0),
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    return [
+        ("normal", frame),
+        ("contrast", clahe),
+        ("bw-otsu", otsu),
+    ]
 
 
 def crop_frame(frame, roi: tuple[int, int, int, int] | None):
@@ -150,6 +185,17 @@ def auto_ocr_frames(frame, roi: tuple[int, int, int, int] | None):
     return [(name, crop) for name, crop in crops if crop is not None and crop.size]
 
 
+def raw_ocr_frames(frame, roi: tuple[int, int, int, int] | None):
+    if roi:
+        return [("roi", crop_frame(frame, roi))]
+
+    frames = [("full", frame)]
+    screen = detect_screen_crop(frame)
+    if screen is not None and screen.size:
+        frames.append(("screen", screen))
+    return frames
+
+
 def ocr_best_frame(frame, roi: tuple[int, int, int, int] | None):
     best = None
     for name, target in auto_ocr_frames(frame, roi):
@@ -174,10 +220,11 @@ def easyocr_results(image):
         detail=1,
         paragraph=False,
         decoder="greedy",
-        contrast_ths=0.05,
-        adjust_contrast=0.7,
-        text_threshold=0.4,
-        low_text=0.3,
+        contrast_ths=EASYOCR_CONTRAST_THRESHOLD,
+        adjust_contrast=EASYOCR_ADJUST_CONTRAST,
+        text_threshold=EASYOCR_TEXT_THRESHOLD,
+        low_text=EASYOCR_LOW_TEXT,
+        link_threshold=EASYOCR_LINK_THRESHOLD,
     )
 
 
@@ -192,11 +239,20 @@ def box_height(box):
     return max(ys) - min(ys)
 
 
-def results_to_lines(results, min_confidence: float = 0.2) -> str:
+def box_width(box):
+    xs = [point[0] for point in box]
+    return max(xs) - min(xs)
+
+
+def results_to_lines(results, min_confidence: float = 0.35, min_height: float = 18) -> str:
     items = []
     for box, text, confidence in results:
         text = re.sub(r"\s+", " ", text).strip()
         if not text or confidence < min_confidence:
+            continue
+        height = max(box_height(box), 1)
+        width = max(box_width(box), 1)
+        if height < min_height:
             continue
         x_center, y_center = box_center(box)
         items.append(
@@ -204,7 +260,8 @@ def results_to_lines(results, min_confidence: float = 0.2) -> str:
                 "text": text,
                 "x": x_center,
                 "y": y_center,
-                "height": max(box_height(box), 1),
+                "height": height,
+                "width": width,
             }
         )
 
@@ -228,20 +285,99 @@ def results_to_lines(results, min_confidence: float = 0.2) -> str:
     for line in sorted(lines, key=lambda line: line["y"]):
         parts = sorted(line["items"], key=lambda item: item["x"])
         output_lines.append(" ".join(part["text"] for part in parts))
-    return "\n".join(output_lines)
+    return cleanup_raw_text("\n".join(output_lines))
 
 
-def read_raw_text(frame, roi: tuple[int, int, int, int] | None) -> str:
+def normalize_l_code(match: re.Match) -> str:
+    translation = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "l": "1", "T": "1", "t": "1", "S": "5"})
+    digits = match.group(1).translate(translation)
+    return f"L{digits}" if digits.isdigit() else match.group(0).upper()
+
+
+def normalize_codeish_token(match: re.Match) -> str:
+    token = match.group(0).upper()
+    if token.startswith("L") and len(token) == 6:
+        return LIKELY_L_CODE_RE.sub(normalize_l_code, token)
+    if AGGRESSIVE_CODE_NORMALIZE and any(char.isdigit() for char in token):
+        token = re.sub(r"S$", "5", token)
+    return token
+
+
+def normalize_trailing_code_token(match: re.Match) -> str:
+    prefix, token = match.groups()
+    token = normalize_codeish_token(re.match(r".+", token))
+    if AGGRESSIVE_CODE_NORMALIZE:
+        token = re.sub(r"S$", "5", token)
+        token = re.sub(r"A$", "4", token)
+    return f"{prefix}{token}"
+
+
+def cleanup_raw_text(text: str) -> str:
+    lines = []
+    for line in compact_lines(text):
+        cleaned = LIKELY_L_CODE_RE.sub(normalize_l_code, line)
+        cleaned = CODEISH_TOKEN_RE.sub(normalize_codeish_token, cleaned)
+        cleaned = re.sub(r"\b([A-Z0-9]{4,8})\s*[~_=]\s*([A-Z0-9]{3,8})\b", r"\1 - \2", cleaned)
+        cleaned = re.sub(r"\b(L\d{5})\s+(?:[S5]\s+)?([A-Z0-9]{3,8})\b", r"\1 - \2", cleaned)
+        cleaned = re.sub(r"(\bL\d{5}\s+-\s+)([A-Z0-9]{3,8})\b", normalize_trailing_code_token, cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        lines.append(cleaned)
+
+    if len(lines) > 1:
+        lines = [line for line in lines if not re.fullmatch(r"[A-Z0-9]", line)]
+
+    cleaned_lines = []
+    for index, line in enumerate(lines):
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if re.search(r"\s+[A-Z0-9]$", line) and re.match(r"L\d{5}\b", next_line):
+            line = re.sub(r"\s+[A-Z0-9]$", "", line)
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
+def read_raw_text(
+    frame,
+    roi: tuple[int, int, int, int] | None,
+    min_confidence: float = 0.35,
+    min_height: float = 18,
+) -> str:
     best_text = ""
     best_score = 0.0
-    for _, target in auto_ocr_frames(frame, roi):
-        text = results_to_lines(easyocr_results(target))
-        if not text:
-            continue
-        score = text_score(text)
-        if score > best_score:
-            best_text = text
-            best_score = score
+    seen = set()
+    crops = raw_ocr_frames(frame, roi)
+    variant_passes = [
+        [("normal", target) for crop_name, target in crops],
+        [
+            (variant_name, variant)
+            for crop_name, target in crops
+            for variant_name, variant in raw_preprocess_variants(target)
+            if variant_name != "normal"
+        ],
+    ]
+
+    for pass_index, variants in enumerate(variant_passes):
+        for variant_name, variant in variants:
+            text = results_to_lines(
+                easyocr_results(variant),
+                min_confidence=min_confidence,
+                min_height=min_height,
+            )
+            if not text or text in seen:
+                continue
+            seen.add(text)
+
+            score = text_score(text)
+            if looks_like_noise(text):
+                score *= 0.35
+            if variant_name.startswith("bw"):
+                score -= 2
+
+            if score > best_score:
+                best_text = text
+                best_score = score
+        if pass_index == 0 and best_score >= 18 and len(compact_lines(best_text)) >= 2:
+            break
     return best_text.strip()
 
 
@@ -506,8 +642,8 @@ def draw_overlay(frame, status: str, roi: tuple[int, int, int, int] | None) -> N
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read text from a live camera with EasyOCR.")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index. Try 1 or 2 for USB cameras.")
+    parser = argparse.ArgumentParser(description="Read text from sample images or a live camera with EasyOCR.")
+    parser.add_argument("--camera", type=int, help="Open live camera mode with this camera index.")
     parser.add_argument("--image", type=Path, help="OCR one image instead of opening the camera.")
     parser.add_argument("--images", type=Path, help="OCR an image file or every image in a folder.")
     parser.add_argument("--list-cameras", action="store_true", help="Scan camera indexes and report which ones open.")
@@ -517,7 +653,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structured", action="store_true", help="Format known code screens into normalized lines.")
     parser.add_argument("--roi", help="Optional fixed crop rectangle as x,y,w,h.")
     parser.add_argument("--debug-image", type=Path, help="Save the first OCR target image to this path on SPACE.")
+    parser.add_argument("--min-confidence", type=float, default=0.35, help="Ignore EasyOCR boxes below this confidence.")
+    parser.add_argument("--min-height", type=float, default=18, help="Ignore EasyOCR boxes shorter than this many pixels.")
+    parser.add_argument("--text-threshold", type=float, default=0.4, help="EasyOCR text detection threshold.")
+    parser.add_argument("--low-text", type=float, default=0.3, help="EasyOCR low text threshold.")
+    parser.add_argument("--link-threshold", type=float, default=0.4, help="EasyOCR box linking threshold.")
+    parser.add_argument("--contrast-ths", type=float, default=0.05, help="EasyOCR contrast threshold.")
+    parser.add_argument("--adjust-contrast", type=float, default=0.7, help="EasyOCR contrast adjustment amount.")
+    parser.add_argument(
+        "--no-aggressive-code-normalize",
+        action="store_true",
+        help="Disable extra OCR cleanup for mixed code tokens, such as final S/5 and A/4.",
+    )
     return parser.parse_args()
+
+
+def configure_easyocr(args: argparse.Namespace) -> None:
+    global EASYOCR_TEXT_THRESHOLD, EASYOCR_LOW_TEXT, EASYOCR_LINK_THRESHOLD
+    global EASYOCR_CONTRAST_THRESHOLD, EASYOCR_ADJUST_CONTRAST
+    global AGGRESSIVE_CODE_NORMALIZE
+    EASYOCR_TEXT_THRESHOLD = args.text_threshold
+    EASYOCR_LOW_TEXT = args.low_text
+    EASYOCR_LINK_THRESHOLD = args.link_threshold
+    EASYOCR_CONTRAST_THRESHOLD = args.contrast_ths
+    EASYOCR_ADJUST_CONTRAST = args.adjust_contrast
+    AGGRESSIVE_CODE_NORMALIZE = not args.no_aggressive_code_normalize
 
 
 def parse_roi(value: str | None) -> tuple[int, int, int, int] | None:
@@ -587,13 +747,20 @@ def image_paths(path: Path) -> list[Path]:
     fail(f"Image path not found: {path}")
 
 
-def ocr_image(path: Path, roi: tuple[int, int, int, int] | None, structured: bool, code_only: bool) -> str:
+def ocr_image(
+    path: Path,
+    roi: tuple[int, int, int, int] | None,
+    structured: bool,
+    code_only: bool,
+    min_confidence: float,
+    min_height: float,
+) -> str:
     frame = cv2.imread(str(path))
     if frame is None:
         return "Could not read image file."
 
     if not structured and not code_only:
-        return read_raw_text(frame, roi) or "No text detected"
+        return read_raw_text(frame, roi, min_confidence, min_height) or "No text detected"
 
     result = ocr_best_frame(frame, roi)
     if result is None:
@@ -605,7 +772,14 @@ def ocr_image(path: Path, roi: tuple[int, int, int, int] | None, structured: boo
     return format_ocr_result(text, fields)
 
 
-def process_images(path: Path, roi: tuple[int, int, int, int] | None, structured: bool, code_only: bool) -> None:
+def process_images(
+    path: Path,
+    roi: tuple[int, int, int, int] | None,
+    structured: bool,
+    code_only: bool,
+    min_confidence: float,
+    min_height: float,
+) -> None:
     paths = image_paths(path)
     if not paths:
         fail(f"No image files found in: {path}")
@@ -616,12 +790,20 @@ def process_images(path: Path, roi: tuple[int, int, int, int] | None, structured
             if index:
                 print()
             print(f"=== {image_path.name} ===")
-        print(ocr_image(image_path, roi, structured, code_only))
+        print(ocr_image(image_path, roi, structured, code_only, min_confidence, min_height))
+
+
+def default_image_path() -> Path:
+    for path in (Path("nonglare"), Path("tests"), Path("sample2.PNG")):
+        if path.exists():
+            return path
+    fail("No image path provided. Use --images folder_name, --image file_name, or --camera 0.")
 
 
 def main() -> None:
     args = parse_args()
     roi = parse_roi(args.roi)
+    configure_easyocr(args)
 
     if args.list_cameras:
         list_cameras(args.scan_max)
@@ -634,8 +816,15 @@ def main() -> None:
     check_dependencies()
     initialize_ocr()
 
-    if args.image or args.images:
-        process_images(args.images or args.image, roi, args.structured, args.code_only)
+    if args.image or args.images or args.camera is None:
+        process_images(
+            args.images or args.image or default_image_path(),
+            roi,
+            args.structured,
+            args.code_only,
+            args.min_confidence,
+            args.min_height,
+        )
         return
 
     cap = cv2.VideoCapture(args.camera)
@@ -667,7 +856,12 @@ def main() -> None:
                     save_debug_target(frame, roi, args.debug_image)
 
                 if not args.structured and not args.code_only:
-                    output = read_raw_text(frame, roi) or "No text detected"
+                    output = read_raw_text(
+                        frame,
+                        roi,
+                        min_confidence=args.min_confidence,
+                        min_height=args.min_height,
+                    ) or "No text detected"
                     status = "No text detected" if output == "No text detected" else "Text detected"
                     print(output)
                     continue
