@@ -2,6 +2,7 @@
 import argparse
 import re
 import sys
+import warnings
 from pathlib import Path
 
 try:
@@ -10,9 +11,11 @@ except ImportError:
     cv2 = None
 
 try:
-    import pytesseract
+    import easyocr
 except ImportError:
-    pytesseract = None
+    easyocr = None
+
+warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true.*")
 
 
 CODE_RE = re.compile(r"\bL\s*(\d{5})\b")
@@ -24,13 +27,13 @@ FALLBACK_VAR1_RE = re.compile(
     re.IGNORECASE,
 )
 VAR3_RE = re.compile(r"\b(W[Z2][A-Z0-9]{4,})\b", re.IGNORECASE)
-DASH_CODE_RE = re.compile(r"[-–—]\s*([A-Z0-9]{3,8})\b", re.IGNORECASE)
-OCR_CONFIGS = [
-    "--oem 3 --psm 6",
-    "--oem 3 --psm 11",
-    "--oem 3 --psm 12",
-    "--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()-:/ ",
-]
+DASH_CODE_RE = re.compile(r"[-–—_:]\s*([A-Z0-9]{3,8})\b", re.IGNORECASE)
+AFTER_L_CODE_RE = re.compile(
+    r"\bL\s*\d{5}\b\s*(?:\(\s*CM\s*\))?\s*[-–—_:]?\s*([A-Z0-9]{3,8})\b",
+    re.IGNORECASE,
+)
+EASYOCR_READER = None
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def fail(message: str, exit_code: int = 1) -> None:
@@ -41,13 +44,27 @@ def fail(message: str, exit_code: int = 1) -> None:
 def check_dependencies() -> None:
     if cv2 is None:
         fail("Missing Python package: opencv-python. Install it with: poetry add opencv-python")
-    if pytesseract is None:
-        fail("Missing Python package: pytesseract. Install it with: poetry add pytesseract")
+    if easyocr is None:
+        fail("Missing Python package: easyocr. Install it with: poetry add easyocr")
 
+
+def get_reader():
+    global EASYOCR_READER
+    if EASYOCR_READER is None:
+        try:
+            EASYOCR_READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+        except Exception as exc:
+            fail(f"Could not initialize EasyOCR: {exc}")
+    return EASYOCR_READER
+
+
+def initialize_ocr() -> None:
     try:
-        pytesseract.get_tesseract_version()
-    except pytesseract.TesseractNotFoundError:
-        fail("Missing Tesseract OCR engine. Install it with: brew install tesseract")
+        get_reader()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail(f"Could not initialize EasyOCR: {exc}")
 
 
 def preprocess_variants(frame):
@@ -151,6 +168,83 @@ def ocr_best_frame(frame, roi: tuple[int, int, int, int] | None):
     return best
 
 
+def easyocr_results(image):
+    return get_reader().readtext(
+        image,
+        detail=1,
+        paragraph=False,
+        decoder="greedy",
+        contrast_ths=0.05,
+        adjust_contrast=0.7,
+        text_threshold=0.4,
+        low_text=0.3,
+    )
+
+
+def box_center(box):
+    xs = [point[0] for point in box]
+    ys = [point[1] for point in box]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def box_height(box):
+    ys = [point[1] for point in box]
+    return max(ys) - min(ys)
+
+
+def results_to_lines(results, min_confidence: float = 0.2) -> str:
+    items = []
+    for box, text, confidence in results:
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or confidence < min_confidence:
+            continue
+        x_center, y_center = box_center(box)
+        items.append(
+            {
+                "text": text,
+                "x": x_center,
+                "y": y_center,
+                "height": max(box_height(box), 1),
+            }
+        )
+
+    if not items:
+        return ""
+
+    items.sort(key=lambda item: item["y"])
+    lines = []
+    for item in items:
+        for line in lines:
+            tolerance = max(line["height"], item["height"]) * 0.65
+            if abs(item["y"] - line["y"]) <= tolerance:
+                line["items"].append(item)
+                line["y"] = sum(part["y"] for part in line["items"]) / len(line["items"])
+                line["height"] = max(line["height"], item["height"])
+                break
+        else:
+            lines.append({"y": item["y"], "height": item["height"], "items": [item]})
+
+    output_lines = []
+    for line in sorted(lines, key=lambda line: line["y"]):
+        parts = sorted(line["items"], key=lambda item: item["x"])
+        output_lines.append(" ".join(part["text"] for part in parts))
+    return "\n".join(output_lines)
+
+
+def read_raw_text(frame, roi: tuple[int, int, int, int] | None) -> str:
+    best_text = ""
+    best_score = 0.0
+    for _, target in auto_ocr_frames(frame, roi):
+        text = results_to_lines(easyocr_results(target))
+        if not text:
+            continue
+        score = text_score(text)
+        if score > best_score:
+            best_text = text
+            best_score = score
+    return best_text.strip()
+
+
 def candidate_rank(text: str, fields: dict[str, str], confidence: float = 0.0) -> float:
     status_bonus = {"parsed": 1000, "partial": 400, "unparsed": 0}[row_status(fields)]
     field_bonus = sum(80 for key in ("var1", "var2", "var3") if fields[key])
@@ -181,6 +275,12 @@ def find_code(text: str) -> str | None:
     return None
 
 
+def normalize_code_token(token: str) -> str:
+    if not any(char.isdigit() for char in token):
+        return token
+    return token.translate(str.maketrans({"O": "0", "S": "5", "I": "1"}))
+
+
 def extract_fields(text: str) -> dict[str, str]:
     normalized = normalize_text(text).upper()
     var1_match = VAR1_RE.search(normalized)
@@ -189,11 +289,13 @@ def extract_fields(text: str) -> dict[str, str]:
     var3_match = VAR3_RE.search(normalized)
     if not var3_match:
         var3_match = DASH_CODE_RE.search(normalized)
+    if not var3_match:
+        var3_match = AFTER_L_CODE_RE.search(normalized)
 
     return {
-        "var1": var1_match.group(1) if var1_match else "",
+        "var1": normalize_code_token(var1_match.group(1)) if var1_match else "",
         "var2": find_code(normalized) or "",
-        "var3": var3_match.group(1).replace("W2", "WZ", 1) if var3_match else "",
+        "var3": normalize_code_token(var3_match.group(1).replace("W2", "WZ", 1)) if var3_match else "",
         "has_inbound": "INBOUND" in normalized,
         "has_cm": bool(re.search(r"\(\s*CM\s*\)", normalized)),
     }
@@ -230,23 +332,16 @@ def text_score(text: str) -> float:
     return useful_ratio * min(len(compact), 160) + line_bonus - length_penalty - line_penalty
 
 
-def ocr_text_with_confidence(image, config: str) -> tuple[str, float, float, int]:
-    data = pytesseract.image_to_data(
-        image,
-        config=config,
-        output_type=pytesseract.Output.DICT,
-    )
+def ocr_text_with_confidence(image) -> tuple[str, float, float, int]:
+    results = easyocr_results(image)
     words = []
     confidences = []
 
-    for word, confidence in zip(data["text"], data["conf"]):
+    for _, word, confidence in results:
         word = word.strip()
         if not word:
             continue
-        try:
-            confidence_value = float(confidence)
-        except ValueError:
-            continue
+        confidence_value = float(confidence) * 100
         if confidence_value < 0:
             continue
 
@@ -314,40 +409,23 @@ def extract_text_and_code(frame) -> tuple[str | None, str]:
     seen = set()
 
     for variant in preprocess_variants(frame):
-        for config in OCR_CONFIGS:
-            raw_text = clean_text(pytesseract.image_to_string(variant, config=config))
-            if raw_text and raw_text not in seen:
-                seen.add(raw_text)
-                normalized_raw = normalize_text(raw_text)
-                raw_fields = extract_fields(normalized_raw)
-                if row_status(raw_fields) == "parsed":
-                    return raw_fields["var2"], normalized_raw
+        text, average_confidence, max_confidence, word_count = ocr_text_with_confidence(variant)
+        if not text or text in seen:
+            continue
 
-                if not looks_like_noise(raw_text):
-                    raw_rank = candidate_rank(normalized_raw, raw_fields)
-                    if raw_rank > best_rank:
-                        best_text = normalized_raw
-                        best_fields = raw_fields
-                        best_rank = raw_rank
-                        best_is_readable = True
+        seen.add(text)
+        normalized = normalize_text(text)
+        fields = extract_fields(normalized)
+        if row_status(fields) == "parsed":
+            return fields["var2"], normalized
 
-            text, average_confidence, max_confidence, word_count = ocr_text_with_confidence(variant, config)
-            if not text or text in seen:
-                continue
-
-            seen.add(text)
-            normalized = normalize_text(text)
-            fields = extract_fields(normalized)
-            if row_status(fields) == "parsed":
-                return fields["var2"], normalized
-
-            if is_readable_text(text, average_confidence, max_confidence, word_count):
-                rank = candidate_rank(normalized, fields, average_confidence)
-                if rank > best_rank:
-                    best_text = normalized
-                    best_fields = fields
-                    best_rank = rank
-                    best_is_readable = True
+        if is_readable_text(text, average_confidence, max_confidence, word_count) and not looks_like_noise(text):
+            rank = candidate_rank(normalized, fields, average_confidence)
+            if rank > best_rank:
+                best_text = normalized
+                best_fields = fields
+                best_rank = rank
+                best_is_readable = True
 
     if best_is_readable:
         if row_status(best_fields) == "parsed":
@@ -428,13 +506,15 @@ def draw_overlay(frame, status: str, roi: tuple[int, int, int, int] | None) -> N
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read text from a live camera with Tesseract OCR.")
+    parser = argparse.ArgumentParser(description="Read text from a live camera with EasyOCR.")
     parser.add_argument("--camera", type=int, default=0, help="Camera index. Try 1 or 2 for USB cameras.")
     parser.add_argument("--image", type=Path, help="OCR one image instead of opening the camera.")
+    parser.add_argument("--images", type=Path, help="OCR an image file or every image in a folder.")
     parser.add_argument("--list-cameras", action="store_true", help="Scan camera indexes and report which ones open.")
     parser.add_argument("--snapshot-cameras", action="store_true", help="Save one frame from each camera index.")
     parser.add_argument("--scan-max", type=int, default=2, help="Highest camera index to scan with --list-cameras.")
     parser.add_argument("--code-only", action="store_true", help="Print only the extracted L+5 digit code.")
+    parser.add_argument("--structured", action="store_true", help="Format known code screens into normalized lines.")
     parser.add_argument("--roi", help="Optional fixed crop rectangle as x,y,w,h.")
     parser.add_argument("--debug-image", type=Path, help="Save the first OCR target image to this path on SPACE.")
     return parser.parse_args()
@@ -495,6 +575,50 @@ def snapshot_cameras(max_index: int = 2) -> None:
         print("No camera snapshots saved.")
 
 
+def image_paths(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        return sorted(
+            child
+            for child in path.iterdir()
+            if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS
+        )
+    fail(f"Image path not found: {path}")
+
+
+def ocr_image(path: Path, roi: tuple[int, int, int, int] | None, structured: bool, code_only: bool) -> str:
+    frame = cv2.imread(str(path))
+    if frame is None:
+        return "Could not read image file."
+
+    if not structured and not code_only:
+        return read_raw_text(frame, roi) or "No text detected"
+
+    result = ocr_best_frame(frame, roi)
+    if result is None:
+        return "No OCR result."
+
+    _, code, text, fields, _ = result
+    if code_only:
+        return code or "No L + 5 digit code detected."
+    return format_ocr_result(text, fields)
+
+
+def process_images(path: Path, roi: tuple[int, int, int, int] | None, structured: bool, code_only: bool) -> None:
+    paths = image_paths(path)
+    if not paths:
+        fail(f"No image files found in: {path}")
+
+    multiple = len(paths) > 1
+    for index, image_path in enumerate(paths):
+        if multiple:
+            if index:
+                print()
+            print(f"=== {image_path.name} ===")
+        print(ocr_image(image_path, roi, structured, code_only))
+
+
 def main() -> None:
     args = parse_args()
     roi = parse_roi(args.roi)
@@ -508,20 +632,10 @@ def main() -> None:
         return
 
     check_dependencies()
+    initialize_ocr()
 
-    if args.image:
-        if not args.image.exists():
-            fail(f"Image file not found: {args.image}")
-        frame = cv2.imread(str(args.image))
-        if frame is None:
-            fail(f"Could not read image file: {args.image}")
-        result = ocr_best_frame(frame, roi)
-        if result is None:
-            fail("No OCR result.")
-        _, code, text, fields, _ = result
-        if args.code_only and not code:
-            fail("No L + 5 digit code detected.")
-        print(code if args.code_only else format_ocr_result(text, fields))
+    if args.image or args.images:
+        process_images(args.images or args.image, roi, args.structured, args.code_only)
         return
 
     cap = cv2.VideoCapture(args.camera)
@@ -551,6 +665,13 @@ def main() -> None:
             if key == 32:
                 if args.debug_image:
                     save_debug_target(frame, roi, args.debug_image)
+
+                if not args.structured and not args.code_only:
+                    output = read_raw_text(frame, roi) or "No text detected"
+                    status = "No text detected" if output == "No text detected" else "Text detected"
+                    print(output)
+                    continue
+
                 result = ocr_best_frame(frame, roi)
                 if result is None:
                     status = "No OCR result"
