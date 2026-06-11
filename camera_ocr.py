@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
+import io
+import logging
 import re
 import sys
 import warnings
@@ -11,11 +14,15 @@ except ImportError:
     cv2 = None
 
 try:
-    import easyocr
+    from paddleocr import PaddleOCR
 except ImportError:
-    easyocr = None
+    PaddleOCR = None
 
 warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true.*")
+warnings.filterwarnings("ignore", message="No ccache found.*")
+for logger_name in ("paddle", "paddleocr", "paddlex", "ppocr"):
+    logging.getLogger(logger_name).disabled = True
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 
 CODE_RE = re.compile(r"\bL\s*(\d{5})\b")
@@ -32,15 +39,19 @@ AFTER_L_CODE_RE = re.compile(
     r"\bL\s*\d{5}\b\s*(?:\(\s*CM\s*\))?\s*[-–—_:]?\s*([A-Z0-9]{3,8})\b",
     re.IGNORECASE,
 )
-LIKELY_L_CODE_RE = re.compile(r"\b[Ll]([0-9OQDIIlTtS]{5})\b")
+LIKELY_L_CODE_RE = re.compile(r"\b[Ll]([0-9OQDIIlTtSioqds]{5})\b")
+SPACED_L_CODE_RE = re.compile(r"\b[Ll]\s*([0-9OQDIIlTtSioqds](?:\s*[0-9OQDIIlTtSioqds]){4})\b")
 CODEISH_TOKEN_RE = re.compile(r"\b(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{4,8}\b")
-EASYOCR_READER = None
+PADDLE_OCR = None
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-EASYOCR_TEXT_THRESHOLD = 0.4
-EASYOCR_LOW_TEXT = 0.3
-EASYOCR_LINK_THRESHOLD = 0.4
-EASYOCR_CONTRAST_THRESHOLD = 0.05
-EASYOCR_ADJUST_CONTRAST = 0.7
+PADDLE_DET_MODEL = "PP-OCRv5_mobile_det"
+PADDLE_REC_MODEL = "PP-OCRv5_mobile_rec"
+PADDLE_DET_LIMIT_SIDE_LEN = 960
+PADDLE_DET_LIMIT_TYPE = "max"
+PADDLE_DET_THRESH = 0.3
+PADDLE_DET_BOX_THRESH = 0.6
+PADDLE_DET_UNCLIP_RATIO = 1.5
+PADDLE_REC_SCORE_THRESH = 0.0
 AGGRESSIVE_CODE_NORMALIZE = True
 
 
@@ -52,77 +63,48 @@ def fail(message: str, exit_code: int = 1) -> None:
 def check_dependencies() -> None:
     if cv2 is None:
         fail("Missing Python package: opencv-python. Install it with: poetry add opencv-python")
-    if easyocr is None:
-        fail("Missing Python package: easyocr. Install it with: poetry add easyocr")
+    if PaddleOCR is None:
+        fail("Missing Python package: paddleocr. Install it with: poetry add paddleocr paddlepaddle")
 
 
-def get_reader():
-    global EASYOCR_READER
-    if EASYOCR_READER is None:
+def get_ocr():
+    global PADDLE_OCR
+    if PADDLE_OCR is None:
         try:
-            EASYOCR_READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                PADDLE_OCR = PaddleOCR(
+                    text_detection_model_name=PADDLE_DET_MODEL,
+                    text_recognition_model_name=PADDLE_REC_MODEL,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                text_det_limit_side_len=PADDLE_DET_LIMIT_SIDE_LEN,
+                text_det_limit_type=PADDLE_DET_LIMIT_TYPE,
+                text_det_thresh=PADDLE_DET_THRESH,
+                    text_det_box_thresh=PADDLE_DET_BOX_THRESH,
+                    text_det_unclip_ratio=PADDLE_DET_UNCLIP_RATIO,
+                    text_rec_score_thresh=PADDLE_REC_SCORE_THRESH,
+                )
         except Exception as exc:
-            fail(f"Could not initialize EasyOCR: {exc}")
-    return EASYOCR_READER
+            fail(f"Could not initialize PaddleOCR: {exc}")
+    return PADDLE_OCR
 
 
 def initialize_ocr() -> None:
     try:
-        get_reader()
+        get_ocr()
     except SystemExit:
         raise
     except Exception as exc:
-        fail(f"Could not initialize EasyOCR: {exc}")
+        fail(f"Could not initialize PaddleOCR: {exc}")
 
 
 def preprocess_variants(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    big = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    blurred = cv2.GaussianBlur(scaled, (3, 3), 0)
-    _, thresh = cv2.threshold(
-        blurred,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-    adaptive = cv2.adaptiveThreshold(
-        blurred,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11,
-    )
-    inverted = cv2.bitwise_not(thresh)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(scaled)
-    sharp = cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 1.2), -0.6, 0)
-    _, clahe_bw = cv2.threshold(
-        cv2.GaussianBlur(clahe, (3, 3), 0),
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-    return [frame, gray, scaled, big, clahe, sharp, thresh, adaptive, clahe_bw, inverted, cv2.bitwise_not(clahe_bw)]
+    return [frame]
 
 
 def raw_preprocess_variants(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(scaled)
-    denoised = cv2.fastNlMeansDenoising(clahe, None, 10, 7, 21)
-    sharp = cv2.addWeighted(denoised, 1.7, cv2.GaussianBlur(denoised, (0, 0), 1.1), -0.7, 0)
-    _, otsu = cv2.threshold(
-        cv2.GaussianBlur(sharp, (3, 3), 0),
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-    return [
-        ("normal", frame),
-        ("contrast", clahe),
-        ("bw-otsu", otsu),
-    ]
+    return [("normal", frame)]
 
 
 def crop_frame(frame, roi: tuple[int, int, int, int] | None):
@@ -131,6 +113,19 @@ def crop_frame(frame, roi: tuple[int, int, int, int] | None):
 
     x, y, w, h = roi
     return frame[y : y + h, x : x + w]
+
+
+def digital_zoom(frame, zoom: float):
+    if zoom <= 1.0:
+        return frame
+
+    height, width = frame.shape[:2]
+    crop_width = max(1, int(width / zoom))
+    crop_height = max(1, int(height / zoom))
+    x1 = max(0, (width - crop_width) // 2)
+    y1 = max(0, (height - crop_height) // 2)
+    cropped = frame[y1 : y1 + crop_height, x1 : x1 + crop_width]
+    return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_CUBIC)
 
 
 def detect_screen_crop(frame):
@@ -214,18 +209,33 @@ def ocr_best_frame(frame, roi: tuple[int, int, int, int] | None):
     return best
 
 
-def easyocr_results(image):
-    return get_reader().readtext(
-        image,
-        detail=1,
-        paragraph=False,
-        decoder="greedy",
-        contrast_ths=EASYOCR_CONTRAST_THRESHOLD,
-        adjust_contrast=EASYOCR_ADJUST_CONTRAST,
-        text_threshold=EASYOCR_TEXT_THRESHOLD,
-        low_text=EASYOCR_LOW_TEXT,
-        link_threshold=EASYOCR_LINK_THRESHOLD,
-    )
+def paddleocr_results(image):
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        predictions = get_ocr().predict(image)
+    results = []
+
+    for prediction in predictions:
+        if isinstance(prediction, dict):
+            boxes = prediction.get("rec_polys") or prediction.get("dt_polys") or []
+            texts = prediction.get("rec_texts") or []
+            scores = prediction.get("rec_scores") or []
+            for box, text, score in zip(boxes, texts, scores):
+                results.append((box.tolist() if hasattr(box, "tolist") else box, text, float(score)))
+            continue
+
+        # Compatibility fallback for older PaddleOCR tuple/list result shapes.
+        for item in prediction or []:
+            if not item or len(item) < 2:
+                continue
+            box = item[0]
+            text_info = item[1]
+            if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                text, score = text_info[0], text_info[1]
+                results.append((box, text, float(score)))
+
+    return results
 
 
 def box_center(box):
@@ -288,9 +298,31 @@ def results_to_lines(results, min_confidence: float = 0.35, min_height: float = 
     return cleanup_raw_text("\n".join(output_lines))
 
 
+DIGIT_SLOT_TRANSLATION = str.maketrans(
+    {
+        "O": "0",
+        "o": "0",
+        "Q": "0",
+        "q": "0",
+        "D": "0",
+        "d": "0",
+        "I": "1",
+        "i": "1",
+        "l": "1",
+        "T": "1",
+        "t": "1",
+        "S": "5",
+        "s": "5",
+    }
+)
+
+
+def normalize_digit_slots(text: str) -> str:
+    return re.sub(r"\s+", "", text).translate(DIGIT_SLOT_TRANSLATION)
+
+
 def normalize_l_code(match: re.Match) -> str:
-    translation = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "l": "1", "T": "1", "t": "1", "S": "5"})
-    digits = match.group(1).translate(translation)
+    digits = normalize_digit_slots(match.group(1))
     return f"L{digits}" if digits.isdigit() else match.group(0).upper()
 
 
@@ -315,10 +347,14 @@ def normalize_trailing_code_token(match: re.Match) -> str:
 def cleanup_raw_text(text: str) -> str:
     lines = []
     for line in compact_lines(text):
+        line = SPACED_L_CODE_RE.sub(normalize_l_code, line)
         cleaned = LIKELY_L_CODE_RE.sub(normalize_l_code, line)
         cleaned = CODEISH_TOKEN_RE.sub(normalize_codeish_token, cleaned)
+        cleaned = re.sub(r"\b([A-Z0-9]{4,8})\s*\(([^)]*)\)", r"\1 (\2)", cleaned)
         cleaned = re.sub(r"\b([A-Z0-9]{4,8})\s*[~_=]\s*([A-Z0-9]{3,8})\b", r"\1 - \2", cleaned)
-        cleaned = re.sub(r"\b(L\d{5})\s+(?:[S5]\s+)?([A-Z0-9]{3,8})\b", r"\1 - \2", cleaned)
+        cleaned = re.sub(r"\b(L\d{5})\s*[-–—]\s*([A-Z0-9]{3,8})\b", r"\1 - \2", cleaned)
+        cleaned = re.sub(r"\b(L\d{5})\s+(?:[S5Xx]\s+)?([A-Z0-9]{3,8})\b", r"\1 - \2", cleaned)
+        cleaned = re.sub(r"\)\s*-\s*", ") - ", cleaned)
         cleaned = re.sub(r"(\bL\d{5}\s+-\s+)([A-Z0-9]{3,8})\b", normalize_trailing_code_token, cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         lines.append(cleaned)
@@ -332,6 +368,17 @@ def cleanup_raw_text(text: str) -> str:
         if re.search(r"\s+[A-Z0-9]$", line) and re.match(r"L\d{5}\b", next_line):
             line = re.sub(r"\s+[A-Z0-9]$", "", line)
         cleaned_lines.append(line)
+
+    if any(re.search(r"\bL\d{5}\b", line) for line in cleaned_lines):
+        cleaned_lines = [
+            line
+            for line in cleaned_lines
+            if not (
+                re.fullmatch(r"[A-Z]{4,}", line)
+                and "INBOUND" not in line.upper()
+                and "CM" not in line.upper()
+            )
+        ]
 
     return "\n".join(cleaned_lines)
 
@@ -359,7 +406,7 @@ def read_raw_text(
     for pass_index, variants in enumerate(variant_passes):
         for variant_name, variant in variants:
             text = results_to_lines(
-                easyocr_results(variant),
+                paddleocr_results(variant),
                 min_confidence=min_confidence,
                 min_height=min_height,
             )
@@ -469,7 +516,7 @@ def text_score(text: str) -> float:
 
 
 def ocr_text_with_confidence(image) -> tuple[str, float, float, int]:
-    results = easyocr_results(image)
+    results = paddleocr_results(image)
     words = []
     confidences = []
 
@@ -614,11 +661,11 @@ def format_ocr_result(text: str, fields: dict[str, str]) -> str:
     return "\n".join(lines) if lines else "No text detected"
 
 
-def draw_overlay(frame, status: str, roi: tuple[int, int, int, int] | None) -> None:
+def draw_overlay(frame, status: str, roi: tuple[int, int, int, int] | None, zoom: float = 1.0) -> None:
     cv2.rectangle(frame, (0, 0), (frame.shape[1], 72), (0, 0, 0), -1)
     cv2.putText(
         frame,
-        "SPACE: capture OCR   Q/ESC: quit",
+        f"SPACE: OCR   +/-: zoom {zoom:.1f}x   Q/ESC: quit",
         (16, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -642,8 +689,8 @@ def draw_overlay(frame, status: str, roi: tuple[int, int, int, int] | None) -> N
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read text from sample images or a live camera with EasyOCR.")
-    parser.add_argument("--camera", type=int, help="Open live camera mode with this camera index.")
+    parser = argparse.ArgumentParser(description="Read text from a live camera or sample images with PaddleOCR.")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index for live camera mode.")
     parser.add_argument("--image", type=Path, help="OCR one image instead of opening the camera.")
     parser.add_argument("--images", type=Path, help="OCR an image file or every image in a folder.")
     parser.add_argument("--list-cameras", action="store_true", help="Scan camera indexes and report which ones open.")
@@ -652,14 +699,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code-only", action="store_true", help="Print only the extracted L+5 digit code.")
     parser.add_argument("--structured", action="store_true", help="Format known code screens into normalized lines.")
     parser.add_argument("--roi", help="Optional fixed crop rectangle as x,y,w,h.")
+    parser.add_argument("--zoom", type=float, default=1.0, help="Digital center zoom for live camera mode.")
     parser.add_argument("--debug-image", type=Path, help="Save the first OCR target image to this path on SPACE.")
-    parser.add_argument("--min-confidence", type=float, default=0.35, help="Ignore EasyOCR boxes below this confidence.")
-    parser.add_argument("--min-height", type=float, default=18, help="Ignore EasyOCR boxes shorter than this many pixels.")
-    parser.add_argument("--text-threshold", type=float, default=0.4, help="EasyOCR text detection threshold.")
-    parser.add_argument("--low-text", type=float, default=0.3, help="EasyOCR low text threshold.")
-    parser.add_argument("--link-threshold", type=float, default=0.4, help="EasyOCR box linking threshold.")
-    parser.add_argument("--contrast-ths", type=float, default=0.05, help="EasyOCR contrast threshold.")
-    parser.add_argument("--adjust-contrast", type=float, default=0.7, help="EasyOCR contrast adjustment amount.")
+    parser.add_argument("--min-confidence", type=float, default=0.35, help="Ignore PaddleOCR boxes below this confidence.")
+    parser.add_argument("--min-height", type=float, default=18, help="Ignore PaddleOCR boxes shorter than this many pixels.")
+    parser.add_argument("--det-limit-side-len", type=int, default=960, help="PaddleOCR detection limit side length.")
+    parser.add_argument("--det-limit-type", choices=("min", "max"), default="max", help="How PaddleOCR scales images for detection.")
+    parser.add_argument("--det-thresh", type=float, default=0.3, help="PaddleOCR text detection threshold.")
+    parser.add_argument("--det-box-thresh", type=float, default=0.6, help="PaddleOCR detected box confidence threshold.")
+    parser.add_argument("--det-unclip-ratio", type=float, default=1.5, help="PaddleOCR detection box expansion ratio.")
+    parser.add_argument("--rec-score-thresh", type=float, default=0.0, help="PaddleOCR recognition score threshold.")
     parser.add_argument(
         "--no-aggressive-code-normalize",
         action="store_true",
@@ -668,15 +717,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_easyocr(args: argparse.Namespace) -> None:
-    global EASYOCR_TEXT_THRESHOLD, EASYOCR_LOW_TEXT, EASYOCR_LINK_THRESHOLD
-    global EASYOCR_CONTRAST_THRESHOLD, EASYOCR_ADJUST_CONTRAST
+def configure_paddleocr(args: argparse.Namespace) -> None:
+    global PADDLE_DET_LIMIT_SIDE_LEN, PADDLE_DET_THRESH, PADDLE_DET_BOX_THRESH
+    global PADDLE_DET_LIMIT_TYPE, PADDLE_DET_UNCLIP_RATIO, PADDLE_REC_SCORE_THRESH
     global AGGRESSIVE_CODE_NORMALIZE
-    EASYOCR_TEXT_THRESHOLD = args.text_threshold
-    EASYOCR_LOW_TEXT = args.low_text
-    EASYOCR_LINK_THRESHOLD = args.link_threshold
-    EASYOCR_CONTRAST_THRESHOLD = args.contrast_ths
-    EASYOCR_ADJUST_CONTRAST = args.adjust_contrast
+    PADDLE_DET_LIMIT_SIDE_LEN = args.det_limit_side_len
+    PADDLE_DET_LIMIT_TYPE = args.det_limit_type
+    PADDLE_DET_THRESH = args.det_thresh
+    PADDLE_DET_BOX_THRESH = args.det_box_thresh
+    PADDLE_DET_UNCLIP_RATIO = args.det_unclip_ratio
+    PADDLE_REC_SCORE_THRESH = args.rec_score_thresh
     AGGRESSIVE_CODE_NORMALIZE = not args.no_aggressive_code_normalize
 
 
@@ -794,7 +844,7 @@ def process_images(
 
 
 def default_image_path() -> Path:
-    for path in (Path("nonglare"), Path("tests"), Path("sample2.PNG")):
+    for path in (Path("zoomin"), Path("nonglare"), Path("tests"), Path("sample2.PNG")):
         if path.exists():
             return path
     fail("No image path provided. Use --images folder_name, --image file_name, or --camera 0.")
@@ -803,7 +853,8 @@ def default_image_path() -> Path:
 def main() -> None:
     args = parse_args()
     roi = parse_roi(args.roi)
-    configure_easyocr(args)
+    zoom = max(1.0, args.zoom)
+    configure_paddleocr(args)
 
     if args.list_cameras:
         list_cameras(args.scan_max)
@@ -816,9 +867,9 @@ def main() -> None:
     check_dependencies()
     initialize_ocr()
 
-    if args.image or args.images or args.camera is None:
+    if args.image or args.images:
         process_images(
-            args.images or args.image or default_image_path(),
+            args.images or args.image,
             roi,
             args.structured,
             args.code_only,
@@ -846,18 +897,19 @@ def main() -> None:
             if not ret:
                 fail("Failed to read a frame from the camera.")
 
-            display = frame.copy()
-            draw_overlay(display, status, roi)
+            ocr_frame = digital_zoom(frame, zoom)
+            display = ocr_frame.copy()
+            draw_overlay(display, status, roi, zoom)
             cv2.imshow(window_name, display)
 
             key = cv2.waitKey(1) & 0xFF
             if key == 32:
                 if args.debug_image:
-                    save_debug_target(frame, roi, args.debug_image)
+                    save_debug_target(ocr_frame, roi, args.debug_image)
 
                 if not args.structured and not args.code_only:
                     output = read_raw_text(
-                        frame,
+                        ocr_frame,
                         roi,
                         min_confidence=args.min_confidence,
                         min_height=args.min_height,
@@ -866,7 +918,7 @@ def main() -> None:
                     print(output)
                     continue
 
-                result = ocr_best_frame(frame, roi)
+                result = ocr_best_frame(ocr_frame, roi)
                 if result is None:
                     status = "No OCR result"
                     print("No OCR result")
@@ -881,6 +933,12 @@ def main() -> None:
                 else:
                     status = "Text detected"
                 print(output)
+            elif key in (ord("+"), ord("=")):
+                zoom = min(4.0, zoom + 0.2)
+                status = f"Zoom {zoom:.1f}x"
+            elif key in (ord("-"), ord("_")):
+                zoom = max(1.0, zoom - 0.2)
+                status = f"Zoom {zoom:.1f}x"
             elif key in (27, ord("q")):
                 break
     finally:
